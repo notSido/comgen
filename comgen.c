@@ -1,13 +1,19 @@
 /* comgen - Natural language to bash command generator */
+#ifdef _WIN32
+#include <lmcons.h>
+#include <windows.h>
+#include <winhttp.h>
+#else
 #include <curl/curl.h>
 #include <pwd.h>
 #include <readline/history.h>
 #include <readline/readline.h>
+#include <sys/utsname.h>
+#include <unistd.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/utsname.h>
-#include <unistd.h>
 
 #define MAX_PROMPT 4096
 #define MAX_RESPONSE 65536
@@ -44,6 +50,41 @@ typedef struct {
 static EnvContext env_ctx;
 
 static void gather_context(void) {
+#ifdef _WIN32
+  /* Current working directory */
+  if (!GetCurrentDirectory(sizeof(env_ctx.cwd), env_ctx.cwd))
+    strcpy(env_ctx.cwd, "unknown");
+
+  /* Home directory */
+  const char *home = getenv("USERPROFILE");
+  if (home)
+    strncpy(env_ctx.home, home, sizeof(env_ctx.home) - 1);
+  else
+    strcpy(env_ctx.home, "unknown");
+
+  /* Username */
+  DWORD len = sizeof(env_ctx.user);
+  if (!GetUserName(env_ctx.user, &len))
+    strcpy(env_ctx.user, "unknown");
+
+  /* Hostname */
+  len = sizeof(env_ctx.hostname);
+  if (!GetComputerName(env_ctx.hostname, &len))
+    strcpy(env_ctx.hostname, "unknown");
+
+  /* OS info */
+  /* Note: GetVersionEx is deprecated but sufficient for basic info here,
+     or we could pull from registry/VerifyVersionInfo */
+  strcpy(env_ctx.os, "Windows"); // Simplifying for now as APIs are messy
+
+  /* Shell */
+  const char *comspec = getenv("COMSPEC");
+  if (comspec)
+    strncpy(env_ctx.shell, comspec, sizeof(env_ctx.shell) - 1);
+  else
+    strcpy(env_ctx.shell, "cmd.exe");
+
+#else
   /* Current working directory */
   if (!getcwd(env_ctx.cwd, sizeof(env_ctx.cwd)))
     strcpy(env_ctx.cwd, "unknown");
@@ -79,6 +120,7 @@ static void gather_context(void) {
     strncpy(env_ctx.shell, shell, sizeof(env_ctx.shell) - 1);
   else
     strcpy(env_ctx.shell, "/bin/bash");
+#endif
 }
 
 static void build_system_prompt(void) {
@@ -105,20 +147,29 @@ static void build_system_prompt(void) {
 }
 
 static void capture_ls_output(void) {
+#ifdef _WIN32
+  FILE *fp = _popen("dir /B", "r");
+#else
   FILE *fp = popen("ls -la", "r");
+#endif
   if (!fp) {
-    printf(C_RED "Failed to run ls -la" C_RESET "\n");
+    printf(C_RED "Failed to run directory listing" C_RESET "\n");
     return;
   }
 
   size_t len = fread(ls_output, 1, sizeof(ls_output) - 1, fp);
   ls_output[len] = '\0';
+#ifdef _WIN32
+  _pclose(fp);
+#else
   pclose(fp);
+#endif
 
   printf(C_DIM "Captured directory listing (%zu bytes)" C_RESET "\n", len);
   build_system_prompt();
 }
 
+#ifndef _WIN32
 static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *data) {
   (void)data;
   size_t len = size * nmemb;
@@ -129,6 +180,7 @@ static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *data) {
   }
   return len;
 }
+#endif
 
 /* Simple JSON string escape */
 static void json_escape(const char *src, char *dst, size_t dstlen) {
@@ -187,10 +239,6 @@ static char *extract_content(const char *json) {
 }
 
 static char *generate_command(const char *prompt, const char *api_key) {
-  CURL *curl = curl_easy_init();
-  if (!curl)
-    return NULL;
-
   char escaped_prompt[MAX_PROMPT * 2];
   char escaped_system[MAX_SYSTEM_PROMPT * 2];
   json_escape(prompt, escaped_prompt, sizeof(escaped_prompt));
@@ -203,6 +251,88 @@ static char *generate_command(const char *prompt, const char *api_key) {
            "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
            escaped_system, escaped_prompt);
 
+#ifdef _WIN32
+  HINTERNET hSession =
+      WinHttpOpen(L"comgen/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+  if (!hSession) {
+    free(post_data);
+    return NULL;
+  }
+
+  HINTERNET hConnect = WinHttpConnect(hSession, L"api.anthropic.com",
+                                      INTERNET_DEFAULT_HTTPS_PORT, 0);
+  if (!hConnect) {
+    WinHttpCloseHandle(hSession);
+    free(post_data);
+    return NULL;
+  }
+
+  HINTERNET hRequest = WinHttpOpenRequest(
+      hConnect, L"POST", L"/v1/messages", NULL, WINHTTP_NO_REFERER,
+      WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+  if (!hRequest) {
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    free(post_data);
+    return NULL;
+  }
+
+  wchar_t headers[1024];
+  swprintf(headers, 1024,
+           L"Content-Type: application/json\r\n"
+           L"x-api-key: %S\r\n"
+           L"anthropic-version: 2023-06-01",
+           api_key);
+
+  BOOL bResults = WinHttpSendRequest(hRequest, headers, -1L, post_data,
+                                     strlen(post_data), strlen(post_data), 0);
+
+  if (bResults)
+    bResults = WinHttpReceiveResponse(hRequest, NULL);
+
+  response_len = 0;
+  if (bResults) {
+    DWORD dwSize = 0;
+    DWORD dwDownloaded = 0;
+    do {
+      dwSize = 0;
+      if (!WinHttpQueryDataAvailable(hRequest, &dwSize))
+        break;
+
+      if (!dwSize)
+        break;
+
+      char *pszOutBuffer = malloc(dwSize + 1);
+      if (!pszOutBuffer)
+        break;
+
+      ZeroMemory(pszOutBuffer, dwSize + 1);
+      if (WinHttpReadData(hRequest, (LPVOID)pszOutBuffer, dwSize,
+                          &dwDownloaded)) {
+        if (response_len + dwDownloaded < MAX_RESPONSE - 1) {
+          memcpy(response_buf + response_len, pszOutBuffer, dwDownloaded);
+          response_len += dwDownloaded;
+          response_buf[response_len] = '\0';
+        }
+      }
+      free(pszOutBuffer);
+    } while (dwSize > 0);
+  } else {
+    fprintf(stderr, C_RED "Error in WinHttp request: %lu" C_RESET "\n",
+            GetLastError());
+  }
+
+  WinHttpCloseHandle(hRequest);
+  WinHttpCloseHandle(hConnect);
+  WinHttpCloseHandle(hSession);
+  free(post_data);
+
+  if (!response_len)
+    return NULL;
+  return extract_content(response_buf);
+
+#else
   char auth_header[256];
   snprintf(auth_header, sizeof(auth_header), "x-api-key: %s", api_key);
 
@@ -213,6 +343,12 @@ static char *generate_command(const char *prompt, const char *api_key) {
 
   response_len = 0;
   response_buf[0] = '\0';
+
+  CURL *curl = curl_easy_init();
+  if (!curl) {
+    free(post_data);
+    return NULL;
+  }
 
   curl_easy_setopt(curl, CURLOPT_URL, "https://api.anthropic.com/v1/messages");
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -231,12 +367,21 @@ static char *generate_command(const char *prompt, const char *api_key) {
   }
 
   return extract_content(response_buf);
+#endif
 }
 
 static int execute_command(const char *cmd) {
   printf("\n" C_DIM "Executing..." C_RESET "\n\n");
   int ret = system(cmd);
   printf("\n");
+#ifdef _WIN32
+  // On Windows system() returns the exit code directly
+  if (ret == 0)
+    printf(C_GREEN "✓ Success" C_RESET "\n");
+  else
+    printf(C_RED "✗ Exit code: %d" C_RESET "\n", ret);
+  return ret;
+#else
   if (WIFEXITED(ret)) {
     int code = WEXITSTATUS(ret);
     if (code == 0)
@@ -246,6 +391,7 @@ static int execute_command(const char *cmd) {
     return code;
   }
   return -1;
+#endif
 }
 
 static void print_command(const char *cmd) {
@@ -276,8 +422,12 @@ int main(void) {
     return 1;
   }
 
+#ifdef _WIN32
+  SetConsoleOutputCP(CP_UTF8);
+#else
   curl_global_init(CURL_GLOBAL_DEFAULT);
   using_history();
+#endif
 
   /* Gather environment context */
   gather_context();
@@ -287,9 +437,24 @@ int main(void) {
   printf(C_DIM "Type /q to quit" C_RESET "\n\n");
 
   char *line;
+#ifdef _WIN32
+  char win_line[4096];
+  printf(C_BLUE C_BOLD "comgen> " C_RESET);
+  while (fgets(win_line, sizeof(win_line), stdin)) {
+    char *c = strchr(win_line, '\n');
+    if (c)
+      *c = '\0';
+    if (win_line[strlen(win_line) - 1] == '\r')
+      win_line[strlen(win_line) - 1] = '\0';
+    line = strdup(win_line);
+#else
   while ((line = readline(C_BLUE C_BOLD "comgen> " C_RESET)) != NULL) {
+#endif
     if (!*line) {
       free(line);
+#ifdef _WIN32
+      printf(C_BLUE C_BOLD "comgen> " C_RESET);
+#endif
       continue;
     }
 
@@ -302,19 +467,32 @@ int main(void) {
       printf("Type natural language, get bash commands.\n");
       printf("/q quit  /h help\n");
       free(line);
+#ifdef _WIN32
+      printf(C_BLUE C_BOLD "comgen> " C_RESET);
+#endif
       continue;
     }
     if (strcmp(line, "/ls") == 0) {
       capture_ls_output();
       free(line);
+#ifdef _WIN32
+      printf(C_BLUE C_BOLD "comgen> " C_RESET);
+#endif
       continue;
     }
 
+#ifndef _WIN32
     add_history(line);
+#endif
 
     /* Refresh cwd in case it changed */
+#ifdef _WIN32
+    if (GetCurrentDirectory(sizeof(env_ctx.cwd), env_ctx.cwd))
+      build_system_prompt();
+#else
     if (getcwd(env_ctx.cwd, sizeof(env_ctx.cwd)))
       build_system_prompt();
+#endif
 
     printf(C_DIM "Thinking..." C_RESET "\r");
     fflush(stdout);
@@ -325,12 +503,18 @@ int main(void) {
     if (!cmd) {
       printf(C_RED "Failed to generate command" C_RESET "\n");
       free(line);
+#ifdef _WIN32
+      printf(C_BLUE C_BOLD "comgen> " C_RESET);
+#endif
       continue;
     }
 
     if (strncmp(cmd, "ERROR:", 6) == 0) {
       printf(C_RED "%s" C_RESET "\n", cmd);
       free(line);
+#ifdef _WIN32
+      printf(C_BLUE C_BOLD "comgen> " C_RESET);
+#endif
       continue;
     }
 
@@ -341,19 +525,34 @@ int main(void) {
     if (action == 'y') {
       execute_command(cmd);
     } else if (action == 'e') {
+#ifdef _WIN32
+      printf(C_YELLOW "$ " C_RESET);
+      if (fgets(win_line, sizeof(win_line), stdin)) {
+        char *c = strchr(win_line, '\n');
+        if (c)
+          *c = '\0';
+        execute_command(win_line);
+      }
+#else
       char *edited = readline(C_YELLOW "$ " C_RESET);
       if (edited && *edited) {
         execute_command(edited);
         free(edited);
       }
+#endif
     } else {
       printf(C_DIM "Skipped" C_RESET "\n");
     }
 
     free(line);
+#ifdef _WIN32
+    printf(C_BLUE C_BOLD "comgen> " C_RESET);
+#endif
   }
 
   printf(C_DIM "Goodbye!" C_RESET "\n");
+#ifndef _WIN32
   curl_global_cleanup();
+#endif
   return 0;
 }
