@@ -3,13 +3,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pwd.h>
+#include <sys/utsname.h>
 #include <curl/curl.h>
 #include <readline/readline.h>
 #include <readline/history.h>
 
-#define MAX_INPUT 4096
+#define MAX_PROMPT 4096
 #define MAX_RESPONSE 65536
 #define MAX_CMD 8192
+#define MAX_SYSTEM_PROMPT 4096
 
 /* ANSI colors */
 #define C_RESET "\033[0m"
@@ -24,11 +27,73 @@
 
 static char response_buf[MAX_RESPONSE];
 static size_t response_len;
+static char system_prompt[MAX_SYSTEM_PROMPT];
 
-static const char *SYSTEM_PROMPT =
-    "You are a command-line assistant. Convert natural language to a single bash command. "
-    "Output ONLY the command, no explanations or markdown. "
-    "If impossible, respond with: ERROR: reason";
+/* Environment context */
+typedef struct {
+    char cwd[1024];
+    char home[256];
+    char user[64];
+    char hostname[64];
+    char os[256];
+    char shell[128];
+} EnvContext;
+
+static EnvContext env_ctx;
+
+static void gather_context(void) {
+    /* Current working directory */
+    if (!getcwd(env_ctx.cwd, sizeof(env_ctx.cwd)))
+        strcpy(env_ctx.cwd, "unknown");
+
+    /* Home directory */
+    const char *home = getenv("HOME");
+    if (home)
+        strncpy(env_ctx.home, home, sizeof(env_ctx.home) - 1);
+    else
+        strcpy(env_ctx.home, "unknown");
+
+    /* Username */
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_name)
+        strncpy(env_ctx.user, pw->pw_name, sizeof(env_ctx.user) - 1);
+    else
+        strcpy(env_ctx.user, "unknown");
+
+    /* Hostname */
+    if (gethostname(env_ctx.hostname, sizeof(env_ctx.hostname)) != 0)
+        strcpy(env_ctx.hostname, "unknown");
+
+    /* OS info */
+    struct utsname uts;
+    if (uname(&uts) == 0)
+        snprintf(env_ctx.os, sizeof(env_ctx.os), "%s %s", uts.sysname, uts.release);
+    else
+        strcpy(env_ctx.os, "unknown");
+
+    /* Shell */
+    const char *shell = getenv("SHELL");
+    if (shell)
+        strncpy(env_ctx.shell, shell, sizeof(env_ctx.shell) - 1);
+    else
+        strcpy(env_ctx.shell, "/bin/bash");
+}
+
+static void build_system_prompt(void) {
+    snprintf(system_prompt, sizeof(system_prompt),
+        "You are a command-line assistant. Convert natural language to a single bash command. "
+        "Output ONLY the command, no explanations or markdown. "
+        "If impossible, respond with: ERROR: reason\n\n"
+        "Environment:\n"
+        "- OS: %s\n"
+        "- Shell: %s\n"
+        "- User: %s\n"
+        "- Hostname: %s\n"
+        "- Home: %s\n"
+        "- CWD: %s",
+        env_ctx.os, env_ctx.shell, env_ctx.user,
+        env_ctx.hostname, env_ctx.home, env_ctx.cwd);
+}
 
 static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *data) {
     (void)data;
@@ -84,13 +149,13 @@ static char *generate_command(const char *prompt, const char *api_key) {
     CURL *curl = curl_easy_init();
     if (!curl) return NULL;
 
-    char escaped_prompt[MAX_INPUT * 2];
-    char escaped_system[2048];
+    char escaped_prompt[MAX_PROMPT * 2];
+    char escaped_system[MAX_SYSTEM_PROMPT * 2];
     json_escape(prompt, escaped_prompt, sizeof(escaped_prompt));
-    json_escape(SYSTEM_PROMPT, escaped_system, sizeof(escaped_system));
+    json_escape(system_prompt, escaped_system, sizeof(escaped_system));
 
-    char *post_data = malloc(MAX_INPUT * 3);
-    snprintf(post_data, MAX_INPUT * 3,
+    char *post_data = malloc(MAX_PROMPT * 3 + MAX_SYSTEM_PROMPT * 2);
+    snprintf(post_data, MAX_PROMPT * 3 + MAX_SYSTEM_PROMPT * 2,
         "{\"model\":\"claude-sonnet-4-20250514\",\"max_tokens\":1024,"
         "\"system\":\"%s\","
         "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
@@ -145,7 +210,7 @@ static void print_command(const char *cmd) {
     printf("\n" C_MAGENTA C_BOLD "Command:" C_RESET " %s\n", cmd);
 }
 
-static char prompt_action(const char *cmd) {
+static char prompt_action(void) {
     printf(C_DIM "Execute? " C_RESET "[" C_GREEN "y" C_RESET "/"
            C_RED "n" C_RESET "/" C_YELLOW "e" C_RESET "dit]: ");
     fflush(stdout);
@@ -169,6 +234,10 @@ int main(void) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     using_history();
 
+    /* Gather environment context */
+    gather_context();
+    build_system_prompt();
+
     printf(C_BOLD C_MAGENTA "comgen" C_RESET " - Natural language to bash\n");
     printf(C_DIM "Type /q to quit" C_RESET "\n\n");
 
@@ -190,6 +259,10 @@ int main(void) {
 
         add_history(line);
 
+        /* Refresh cwd in case it changed */
+        if (getcwd(env_ctx.cwd, sizeof(env_ctx.cwd)))
+            build_system_prompt();
+
         printf(C_DIM "Thinking..." C_RESET "\r");
         fflush(stdout);
 
@@ -210,7 +283,7 @@ int main(void) {
 
         print_command(cmd);
 
-        char action = prompt_action(cmd);
+        char action = prompt_action();
 
         if (action == 'y') {
             execute_command(cmd);
