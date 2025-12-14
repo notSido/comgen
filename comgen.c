@@ -1,4 +1,4 @@
-/* comgen - Natural language to bash command generator */
+/* comgen - Natural language to shell command generator */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,10 +6,17 @@
 #include <curl/curl.h>
 #include <readline/readline.h>
 #include <readline/history.h>
+#include <getopt.h>
 
-#define MAX_INPUT 4096
+#define MAX_PROMPT 4096
 #define MAX_RESPONSE 65536
 #define MAX_CMD 8192
+
+/* Shell types */
+typedef enum {
+    SHELL_BASH,
+    SHELL_POWERSHELL
+} ShellType;
 
 /* ANSI colors */
 #define C_RESET "\033[0m"
@@ -24,11 +31,25 @@
 
 static char response_buf[MAX_RESPONSE];
 static size_t response_len;
+static ShellType current_shell = SHELL_BASH;
 
-static const char *SYSTEM_PROMPT =
+static const char *BASH_SYSTEM_PROMPT =
     "You are a command-line assistant. Convert natural language to a single bash command. "
     "Output ONLY the command, no explanations or markdown. "
     "If impossible, respond with: ERROR: reason";
+
+static const char *POWERSHELL_SYSTEM_PROMPT =
+    "You are a command-line assistant. Convert natural language to a single PowerShell command. "
+    "Output ONLY the command, no explanations or markdown. Use PowerShell cmdlets and syntax. "
+    "If impossible, respond with: ERROR: reason";
+
+static const char *get_system_prompt(void) {
+    return (current_shell == SHELL_POWERSHELL) ? POWERSHELL_SYSTEM_PROMPT : BASH_SYSTEM_PROMPT;
+}
+
+static const char *get_shell_name(void) {
+    return (current_shell == SHELL_POWERSHELL) ? "PowerShell" : "bash";
+}
 
 static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *data) {
     (void)data;
@@ -84,13 +105,13 @@ static char *generate_command(const char *prompt, const char *api_key) {
     CURL *curl = curl_easy_init();
     if (!curl) return NULL;
 
-    char escaped_prompt[MAX_INPUT * 2];
+    char escaped_prompt[MAX_PROMPT * 2];
     char escaped_system[2048];
     json_escape(prompt, escaped_prompt, sizeof(escaped_prompt));
-    json_escape(SYSTEM_PROMPT, escaped_system, sizeof(escaped_system));
+    json_escape(get_system_prompt(), escaped_system, sizeof(escaped_system));
 
-    char *post_data = malloc(MAX_INPUT * 3);
-    snprintf(post_data, MAX_INPUT * 3,
+    char *post_data = malloc(MAX_PROMPT * 3);
+    snprintf(post_data, MAX_PROMPT * 3,
         "{\"model\":\"claude-sonnet-4-20250514\",\"max_tokens\":1024,"
         "\"system\":\"%s\","
         "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
@@ -128,7 +149,40 @@ static char *generate_command(const char *prompt, const char *api_key) {
 
 static int execute_command(const char *cmd) {
     printf("\n" C_DIM "Executing..." C_RESET "\n\n");
-    int ret = system(cmd);
+    int ret;
+
+    if (current_shell == SHELL_POWERSHELL) {
+        /* Execute via PowerShell (pwsh on Linux/macOS, powershell on Windows) */
+        char *ps_cmd = malloc(strlen(cmd) + 256);
+        if (!ps_cmd) return -1;
+
+        /* Escape single quotes for PowerShell by doubling them */
+        char *escaped = malloc(strlen(cmd) * 2 + 1);
+        if (!escaped) { free(ps_cmd); return -1; }
+
+        size_t j = 0;
+        for (size_t i = 0; cmd[i]; i++) {
+            if (cmd[i] == '\'') {
+                escaped[j++] = '\'';
+                escaped[j++] = '\'';
+            } else {
+                escaped[j++] = cmd[i];
+            }
+        }
+        escaped[j] = '\0';
+
+#ifdef _WIN32
+        snprintf(ps_cmd, strlen(cmd) + 256, "powershell -NoProfile -Command '%s'", escaped);
+#else
+        snprintf(ps_cmd, strlen(cmd) + 256, "pwsh -NoProfile -Command '%s'", escaped);
+#endif
+        ret = system(ps_cmd);
+        free(escaped);
+        free(ps_cmd);
+    } else {
+        ret = system(cmd);
+    }
+
     printf("\n");
     if (WIFEXITED(ret)) {
         int code = WEXITSTATUS(ret);
@@ -145,7 +199,7 @@ static void print_command(const char *cmd) {
     printf("\n" C_MAGENTA C_BOLD "Command:" C_RESET " %s\n", cmd);
 }
 
-static char prompt_action(const char *cmd) {
+static char prompt_action(void) {
     printf(C_DIM "Execute? " C_RESET "[" C_GREEN "y" C_RESET "/"
            C_RED "n" C_RESET "/" C_YELLOW "e" C_RESET "dit]: ");
     fflush(stdout);
@@ -159,7 +213,40 @@ static char prompt_action(const char *cmd) {
     return 'n';
 }
 
-int main(void) {
+static void print_usage(const char *progname) {
+    printf("Usage: %s [OPTIONS]\n", progname);
+    printf("\nOptions:\n");
+    printf("  -b, --bash        Use bash shell (default)\n");
+    printf("  -p, --powershell  Use PowerShell\n");
+    printf("  -h, --help        Show this help message\n");
+}
+
+int main(int argc, char *argv[]) {
+    static struct option long_options[] = {
+        {"bash",       no_argument, 0, 'b'},
+        {"powershell", no_argument, 0, 'p'},
+        {"help",       no_argument, 0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "bph", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'b':
+                current_shell = SHELL_BASH;
+                break;
+            case 'p':
+                current_shell = SHELL_POWERSHELL;
+                break;
+            case 'h':
+                print_usage(argv[0]);
+                return 0;
+            default:
+                print_usage(argv[0]);
+                return 1;
+        }
+    }
+
     const char *api_key = getenv("ANTHROPIC_API_KEY");
     if (!api_key) {
         fprintf(stderr, C_RED "Error: ANTHROPIC_API_KEY not set" C_RESET "\n");
@@ -169,8 +256,8 @@ int main(void) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     using_history();
 
-    printf(C_BOLD C_MAGENTA "comgen" C_RESET " - Natural language to bash\n");
-    printf(C_DIM "Type /q to quit" C_RESET "\n\n");
+    printf(C_BOLD C_MAGENTA "comgen" C_RESET " - Natural language to %s\n", get_shell_name());
+    printf(C_DIM "Type /q to quit, /s to switch shell" C_RESET "\n\n");
 
     char *line;
     while ((line = readline(C_BLUE C_BOLD "comgen> " C_RESET)) != NULL) {
@@ -182,8 +269,15 @@ int main(void) {
             break;
         }
         if (strcmp(line, "/h") == 0 || strcmp(line, "/help") == 0) {
-            printf("Type natural language, get bash commands.\n");
-            printf("/q quit  /h help\n");
+            printf("Type natural language, get %s commands.\n", get_shell_name());
+            printf("/q quit  /h help  /s switch shell\n");
+            printf("Current shell: " C_CYAN "%s" C_RESET "\n", get_shell_name());
+            free(line);
+            continue;
+        }
+        if (strcmp(line, "/s") == 0 || strcmp(line, "/shell") == 0) {
+            current_shell = (current_shell == SHELL_BASH) ? SHELL_POWERSHELL : SHELL_BASH;
+            printf("Switched to " C_CYAN "%s" C_RESET "\n", get_shell_name());
             free(line);
             continue;
         }
@@ -210,7 +304,7 @@ int main(void) {
 
         print_command(cmd);
 
-        char action = prompt_action(cmd);
+        char action = prompt_action();
 
         if (action == 'y') {
             execute_command(cmd);
