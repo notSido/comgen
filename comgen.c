@@ -578,7 +578,8 @@ int main(void) {
 #ifdef _WIN32
       GetCurrentDirectory(sizeof(env_ctx.cwd), env_ctx.cwd);
 #else
-      getcwd(env_ctx.cwd, sizeof(env_ctx.cwd));
+      if (!getcwd(env_ctx.cwd, sizeof(env_ctx.cwd)))
+        strcpy(env_ctx.cwd, ".");
 #endif
 
       printf(C_DIM "Thinking..." C_RESET "\r");
