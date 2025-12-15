@@ -644,6 +644,98 @@ static char prompt_action(void) {
   return 'n';
 }
 
+/* Editor Logic */
+static void edit_command_in_editor(char *cmd_buf, size_t buf_size) {
+#ifdef _WIN32
+  char temp_path[MAX_PATH];
+  char temp_file[MAX_PATH];
+
+  if (GetTempPathA(MAX_PATH, temp_path) == 0 ||
+      GetTempFileNameA(temp_path, "comgen", 0, temp_file) == 0) {
+    fprintf(stderr, C_RED "Failed to create temp file" C_RESET "\n");
+    return;
+  }
+
+  FILE *fp = fopen(temp_file, "w");
+  if (fp) {
+    fputs(cmd_buf, fp);
+    fclose(fp);
+  }
+
+  /* Launch Editor */
+  /* Default to notepad on Windows if EDITOR not set */
+  char *env_editor = getenv("EDITOR");
+  char cmd[MAX_PATH * 2 + 32];
+  if (env_editor) {
+    snprintf(cmd, sizeof(cmd), "%s \"%s\"", env_editor, temp_file);
+  } else {
+    snprintf(cmd, sizeof(cmd), "notepad \"%s\"", temp_file);
+  }
+
+  if (system(cmd) == 0) {
+    /* Read back */
+    fp = fopen(temp_file, "r");
+    if (fp) {
+      size_t len = fread(cmd_buf, 1, buf_size - 1, fp);
+      cmd_buf[len] = '\0';
+      /* Trim trailing whitespace/newlines */
+      while (len > 0 &&
+             (cmd_buf[len - 1] == '\n' || cmd_buf[len - 1] == '\r' ||
+              cmd_buf[len - 1] == ' ' || cmd_buf[len - 1] == '\t')) {
+        cmd_buf[--len] = '\0';
+      }
+      fclose(fp);
+    }
+  }
+
+  DeleteFileA(temp_file);
+
+#else
+  char temp_template[] = "/tmp/comgen_XXXXXX";
+  int fd = mkstemp(temp_template);
+  if (fd == -1) {
+    perror("mkstemp");
+    return;
+  }
+
+  if (write(fd, cmd_buf, strlen(cmd_buf)) == -1) {
+    perror("write");
+    close(fd);
+    unlink(temp_template);
+    return;
+  }
+  close(fd);
+
+  const char *editor = getenv("VISUAL");
+  if (!editor)
+    editor = getenv("EDITOR");
+  if (!editor)
+    editor = "vi";
+
+  char sys_cmd[2048];
+  snprintf(sys_cmd, sizeof(sys_cmd), "%s %s", editor, temp_template);
+
+  int ret = system(sys_cmd);
+  if (ret == 0) {
+    FILE *fp = fopen(temp_template, "r");
+    if (fp) {
+      size_t len = fread(cmd_buf, 1, buf_size - 1, fp);
+      cmd_buf[len] = '\0';
+      /* Trim trailing whitespace/newlines */
+      while (len > 0 &&
+             (cmd_buf[len - 1] == '\n' || cmd_buf[len - 1] == '\r' ||
+              cmd_buf[len - 1] == ' ' || cmd_buf[len - 1] == '\t')) {
+        cmd_buf[--len] = '\0';
+      }
+      fclose(fp);
+    }
+  } else {
+    printf(C_RED "Editor exited with error" C_RESET "\n");
+  }
+  unlink(temp_template);
+#endif
+}
+
 int main(void) {
 #ifdef _WIN32
   SetConsoleOutputCP(CP_UTF8);
@@ -741,17 +833,19 @@ int main(void) {
           if (action == 'y')
             execute_command(cmd);
           else if (action == 'e') {
-            /* Simple edit flow */
-            printf(C_YELLOW "Enter command: " C_RESET);
+            /* Open in editor logic */
             char edit_buf[4096];
-            if (fgets(edit_buf, sizeof(edit_buf), stdin)) {
-#ifndef _WIN32
-              edit_buf[strcspn(edit_buf, "\n")] = 0;
+            /* Copy original command to buffer */
+            strncpy(edit_buf, cmd, sizeof(edit_buf) - 1);
+            edit_buf[sizeof(edit_buf) - 1] = '\0';
+
+            edit_command_in_editor(edit_buf, sizeof(edit_buf));
+
+            if (strlen(edit_buf) > 0) {
+              printf(C_YELLOW "Modified command: %s" C_RESET "\n", edit_buf);
               execute_command(edit_buf);
-#else
-              execute_command(edit_buf); /* win fgets includes newline often
-                                            handled by execute */
-#endif
+            } else {
+              printf(C_YELLOW "Operation cancelled (empty command)" C_RESET "\n");
             }
           }
         }

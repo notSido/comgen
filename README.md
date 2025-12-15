@@ -8,7 +8,7 @@
 - **Context Aware**: Knows your OS, Shell, Username, and Current Working Directory to generate accurate commands.
 - **Interactive Session**: Works like a shell prompt.
 - **Safety First**: Requires explicit confirmation (`y`/`n`) before executing any generated command.
-- **Edit Mode**: Edit the generated command (`e`) before running it if it needs tweaking.
+- **Edit Mode**: Edit the generated command (`e`) in your preferred text editor (via `$EDITOR` or `$VISUAL`) before running it.
 - **File Awareness**: Use `/ls` to make the AI aware of the files in your current directory.
 - **Cross-Platform**: Native support for Linux (libcurl/libreadline) and Windows (WinHTTP).
 
