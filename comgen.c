@@ -308,14 +308,14 @@ static char *generate_command(ComgenSession *session, const char *prompt) {
   StringBuffer body;
   sb_init(&body);
 
-  /* Construct JSON body */
-  char head[512];
-  snprintf(head, sizeof(head),
-           "{\"model\":\"%s\",\"max_tokens\":1024,\"system\":\"%s\","
-           "\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
-           session->model, esc_sys, esc_prompt);
-
-  sb_append(&body, head);
+  /* Construct JSON body dynamically to avoid stack buffer limits */
+  sb_append(&body, "{\"model\":\"");
+  sb_append(&body, session->model);
+  sb_append(&body, "\",\"max_tokens\":1024,\"system\":\"");
+  sb_append(&body, esc_sys);
+  sb_append(&body, "\",\"messages\":[{\"role\":\"user\",\"content\":\"");
+  sb_append(&body, esc_prompt);
+  sb_append(&body, "\"}]}");
 
   free(sys_prompt);
   free(esc_sys);
@@ -335,12 +335,22 @@ static char *generate_command(ComgenSession *session, const char *prompt) {
     return NULL;
   }
 
-  wchar_t headers[1024];
-  swprintf(headers, 1024,
+  /* Convert API key to Wide Char safely to avoid format specifier ambiguity */
+  int key_len = MultiByteToWideChar(CP_UTF8, 0, session->api_key, -1, NULL, 0);
+  wchar_t *w_api_key = calloc(key_len, sizeof(wchar_t));
+  if (w_api_key) {
+    MultiByteToWideChar(CP_UTF8, 0, session->api_key, -1, w_api_key, key_len);
+  }
+
+  wchar_t headers[2048];
+  /* Use %ls for wide string which works in both MSVC and Standard C modes */
+  swprintf(headers, 2048,
            L"Content-Type: application/json\r\n"
-           L"x-api-key: %S\r\n"
-           L"anthropic-version: 2023-06-01",
-           session->api_key);
+           L"x-api-key: %ls\r\n"
+           L"anthropic-version: 2023-06-01\r\n",
+           w_api_key ? w_api_key : L"");
+
+  if (w_api_key) free(w_api_key);
 
   BOOL bResults = WinHttpSendRequest(hRequest, headers, -1L, body.data,
                                      (DWORD)body.len, (DWORD)body.len, 0);
