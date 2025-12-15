@@ -48,24 +48,25 @@ You will need an **Anthropic API Key** to use this tool.
 
 ## Configuration
 
-You **must** set your Anthropic API Key environment variable before running `comgen`.
+## Configuration
 
-**Linux/Bash:**
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
+On your first run, `comgen` will ask for your Anthropic API Key and save it automatically.
+
+### Config File
+The configuration is stored in a simple text format:
+- **Linux**: `~/.config/comgen/config`
+- **Windows**: `%APPDATA%\comgen\config`
+
+You can edit this file manually:
+```ini
+api_key=sk-ant-12345...
+model=claude-sonnet-4-20250514
 ```
 
-**Windows (CMD):**
-```cmd
-setx ANTHROPIC_API_KEY "sk-ant-..."
-```
-*(Note: `setx` sets the variable permanently, but you may need to restart your terminal)*
-
-### Optional Settings
-You can override the default model (`claude-sonnet-4-20250514`) by setting:
-```bash
-export COMGEN_MODEL="claude-3-opus-20240229"
-```
+### Environment Variables (Optional)
+You can override the config file settings using environment variables:
+- `ANTHROPIC_API_KEY`: Overrides the stored key.
+- `COMGEN_MODEL`: Overrides the selected model.
 
 ## Usage
 

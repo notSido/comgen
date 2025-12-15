@@ -27,4 +27,4 @@ else
 fi
 
 echo "Done! You can now run 'comgen' from anywhere."
-echo "Make sure to set ANTHROPIC_API_KEY environment variable."
+echo "Run 'comgen' to complete configuration."

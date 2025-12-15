@@ -14,6 +14,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 /* Constants */
 #define DEFAULT_MODEL "claude-sonnet-4-20250514"
@@ -408,15 +414,124 @@ static char *generate_command(ComgenSession *session, const char *prompt) {
   return content;
 }
 
+/* Config Management */
+static void get_config_path(char *buf, size_t size) {
+#ifdef _WIN32
+  const char *appdata = getenv("APPDATA");
+  if (!appdata)
+    appdata = getenv("USERPROFILE");
+  snprintf(buf, size, "%s\\comgen", appdata);
+#else
+  const char *home = getenv("HOME");
+  snprintf(buf, size, "%s/.config/comgen", home);
+#endif
+}
+
+static int ensure_config_dir(void) {
+  char path[1024];
+  get_config_path(path, sizeof(path));
+#ifdef _WIN32
+  return _mkdir(path) == 0 || errno == EEXIST;
+#else
+  /* Try creating parent .config first just in case */
+  char parent[1024];
+  snprintf(parent, sizeof(parent), "%s/.config", getenv("HOME"));
+  mkdir(parent, 0755);
+  return mkdir(path, 0755) == 0 || errno == EEXIST;
+#endif
+}
+
+static void load_config_file(ComgenSession *s) {
+  char path[1024];
+  get_config_path(path, sizeof(path));
+  strcat(path, "/config");
+#ifdef _WIN32
+  for (int i = 0; path[i]; i++)
+    if (path[i] == '/')
+      path[i] = '\\';
+#endif
+
+  FILE *fp = fopen(path, "r");
+  if (!fp)
+    return;
+
+  char line[1024];
+  while (fgets(line, sizeof(line), fp)) {
+    char *eq = strchr(line, '=');
+    if (eq) {
+      *eq = 0;
+      char *key = line;
+      char *val = eq + 1;
+      val[strcspn(val, "\r\n")] = 0;
+
+      if (strcmp(key, "api_key") == 0) {
+        if (s->api_key)
+          free(s->api_key);
+        s->api_key = strdup(val);
+      } else if (strcmp(key, "model") == 0) {
+        if (s->model)
+          free(s->model);
+        s->model = strdup(val);
+      }
+    }
+  }
+  fclose(fp);
+}
+
+static void save_config_file(const char *key, const char *model) {
+  if (!ensure_config_dir())
+    return;
+
+  char path[1024];
+  get_config_path(path, sizeof(path));
+  strcat(path, "/config");
+#ifdef _WIN32
+  for (int i = 0; path[i]; i++)
+    if (path[i] == '/')
+      path[i] = '\\';
+#endif
+
+  FILE *fp = fopen(path, "w");
+  if (fp) {
+    fprintf(fp, "api_key=%s\n", key);
+    if (model)
+      fprintf(fp, "model=%s\n", model);
+    fclose(fp);
+    printf(C_GREEN "Configuration saved to %s" C_RESET "\n", path);
+  } else {
+    printf(C_RED "Failed to save config to %s" C_RESET "\n", path);
+  }
+}
+
 /* Initialization & Cleanup */
 static int session_init(ComgenSession *s) {
-  s->api_key = getenv("ANTHROPIC_API_KEY");
+  s->api_key = NULL;
+  s->model = NULL;
+
+  /* 1. Try Config */
+  load_config_file(s);
+
+  /* 2. Try Env (Override) */
+  char *env_key = getenv("ANTHROPIC_API_KEY");
+  if (env_key) {
+    if (s->api_key)
+      free(s->api_key);
+    s->api_key = strdup(env_key);
+  }
+
+  char *env_model = getenv("COMGEN_MODEL");
+  if (env_model) {
+    if (s->model)
+      free(s->model);
+    s->model = strdup(env_model);
+  }
+
+  /* Defaults */
+  if (!s->model)
+    s->model = strdup(DEFAULT_MODEL);
+
   if (!s->api_key)
     return 0;
-
-  s->model = getenv("COMGEN_MODEL");
-  if (!s->model)
-    s->model = DEFAULT_MODEL;
 
 #ifdef _WIN32
   s->hSession = WinHttpOpen(L"comgen/2.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -481,6 +596,10 @@ static int session_init(ComgenSession *s) {
 }
 
 static void session_cleanup(ComgenSession *s) {
+  if (s->api_key)
+    free(s->api_key);
+  if (s->model)
+    free(s->model);
 #ifdef _WIN32
   if (s->hConnect)
     WinHttpCloseHandle(s->hConnect);
@@ -534,8 +653,33 @@ int main(void) {
 
   ComgenSession session = {0};
   if (!session_init(&session)) {
-    fprintf(stderr, C_RED "Init failed. Check ANTHROPIC_API_KEY." C_RESET "\n");
-    return 1;
+    if (!session.api_key) {
+      printf(C_MAGENTA "Welcome to comgen!" C_RESET "\n");
+      printf("No API key found. Please enter your Anthropic API Key.\n");
+      printf("Key: ");
+      char key_buf[512];
+      if (fgets(key_buf, sizeof(key_buf), stdin)) {
+        key_buf[strcspn(key_buf, "\r\n")] = 0;
+        if (strlen(key_buf) > 10) {
+          save_config_file(key_buf, DEFAULT_MODEL);
+          /* Clean retry */
+          session_cleanup(&session);
+          memset(&session, 0, sizeof(session));
+          if (!session_init(&session)) {
+             fprintf(stderr, C_RED "Init failed after setup." C_RESET "\n");
+             return 1;
+          }
+        } else {
+           fprintf(stderr, C_RED "Invalid key." C_RESET "\n");
+           return 1;
+        }
+      } else {
+         return 1;
+      }
+    } else {
+      fprintf(stderr, C_RED "Init failed (Network/System)." C_RESET "\n");
+      return 1;
+    }
   }
 
   gather_context();

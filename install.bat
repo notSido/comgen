@@ -35,5 +35,5 @@ if %errorlevel% neq 0 (
 
 echo.
 echo Done! You can now run 'comgen' from anywhere.
-echo Remember to set ANTHROPIC_API_KEY environment variable.
+echo Run 'comgen' to complete configuration.
 pause
