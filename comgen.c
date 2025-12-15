@@ -11,10 +11,10 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 #endif
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #ifdef _WIN32
@@ -108,7 +108,34 @@ static void gather_context(void) {
   if (!GetUserName(env_ctx.user, &len))
     strcpy(env_ctx.user, "user");
 
-  strcpy(env_ctx.os, "Win"); // Compact
+  /* Advanced Windows Version Detection via Registry */
+  HKEY hKey;
+  int found_ver = 0;
+  if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                    "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", 0,
+                    KEY_READ, &hKey) == ERROR_SUCCESS) {
+    char product[256] = {0};
+    char build[64] = {0};
+    DWORD p_len = sizeof(product);
+    DWORD b_len = sizeof(build);
+
+    if (RegQueryValueExA(hKey, "ProductName", NULL, NULL, (LPBYTE)product,
+                         &p_len) == ERROR_SUCCESS) {
+      /* Try to get build number too */
+      RegQueryValueExA(hKey, "CurrentBuild", NULL, NULL, (LPBYTE)build, &b_len);
+
+      if (strlen(build) > 0)
+        snprintf(env_ctx.os, sizeof(env_ctx.os), "%s (Build %s)", product,
+                 build);
+      else
+        snprintf(env_ctx.os, sizeof(env_ctx.os), "%s", product);
+      found_ver = 1;
+    }
+    RegCloseKey(hKey);
+  }
+
+  if (!found_ver)
+    strcpy(env_ctx.os, "Windows");
 
   const char *comspec = getenv("COMSPEC");
   strncpy(env_ctx.shell, comspec ? comspec : "cmd", sizeof(env_ctx.shell) - 1);
@@ -119,11 +146,47 @@ static void gather_context(void) {
   struct passwd *pw = getpwuid(getuid());
   strncpy(env_ctx.user, pw ? pw->pw_name : "user", sizeof(env_ctx.user) - 1);
 
-  struct utsname uts;
-  if (uname(&uts) == 0)
-    snprintf(env_ctx.os, sizeof(env_ctx.os), "%s", uts.sysname);
-  else
-    strcpy(env_ctx.os, "Linux");
+  /* Advanced Linux Distro Detection */
+  int found_distro = 0;
+  FILE *os_release = fopen("/etc/os-release", "r");
+  if (os_release) {
+    char line[256];
+    while (fgets(line, sizeof(line), os_release)) {
+      if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
+        char *start = line + 12;
+        char *end = start + strlen(start);
+        /* Trim trailing newline/whitespace */
+        while (end > start &&
+               (*end == '\0' || *end == '\n' || *end == '\r' || *end == ' '))
+          end--;
+        if (*end != '\0' && *end != '"')
+          *(end + 1) = '\0'; /* Null terminate after last char */
+        else
+          *end = '\0'; /* Quote or null handling */
+
+        /* Remove quotes */
+        if (*start == '"')
+          start++;
+        char *quote_end = strrchr(start, '"');
+        if (quote_end)
+          *quote_end = '\0';
+
+        strncpy(env_ctx.os, start, sizeof(env_ctx.os) - 1);
+        found_distro = 1;
+        break;
+      }
+    }
+    fclose(os_release);
+  }
+
+  if (!found_distro) {
+    struct utsname uts;
+    if (uname(&uts) == 0)
+      snprintf(env_ctx.os, sizeof(env_ctx.os), "%s %s", uts.sysname,
+               uts.release);
+    else
+      strcpy(env_ctx.os, "Linux");
+  }
 
   const char *shell = getenv("SHELL");
   /* Extract just the shell name for brevity (e.g. /bin/bash -> bash) */
@@ -356,7 +419,8 @@ static char *generate_command(ComgenSession *session, const char *prompt) {
            L"anthropic-version: 2023-06-01\r\n",
            w_api_key ? w_api_key : L"");
 
-  if (w_api_key) free(w_api_key);
+  if (w_api_key)
+    free(w_api_key);
 
   BOOL bResults = WinHttpSendRequest(hRequest, headers, -1L, body.data,
                                      (DWORD)body.len, (DWORD)body.len, 0);
@@ -679,9 +743,8 @@ static void edit_command_in_editor(char *cmd_buf, size_t buf_size) {
       size_t len = fread(cmd_buf, 1, buf_size - 1, fp);
       cmd_buf[len] = '\0';
       /* Trim trailing whitespace/newlines */
-      while (len > 0 &&
-             (cmd_buf[len - 1] == '\n' || cmd_buf[len - 1] == '\r' ||
-              cmd_buf[len - 1] == ' ' || cmd_buf[len - 1] == '\t')) {
+      while (len > 0 && (cmd_buf[len - 1] == '\n' || cmd_buf[len - 1] == '\r' ||
+                         cmd_buf[len - 1] == ' ' || cmd_buf[len - 1] == '\t')) {
         cmd_buf[--len] = '\0';
       }
       fclose(fp);
@@ -722,9 +785,8 @@ static void edit_command_in_editor(char *cmd_buf, size_t buf_size) {
       size_t len = fread(cmd_buf, 1, buf_size - 1, fp);
       cmd_buf[len] = '\0';
       /* Trim trailing whitespace/newlines */
-      while (len > 0 &&
-             (cmd_buf[len - 1] == '\n' || cmd_buf[len - 1] == '\r' ||
-              cmd_buf[len - 1] == ' ' || cmd_buf[len - 1] == '\t')) {
+      while (len > 0 && (cmd_buf[len - 1] == '\n' || cmd_buf[len - 1] == '\r' ||
+                         cmd_buf[len - 1] == ' ' || cmd_buf[len - 1] == '\t')) {
         cmd_buf[--len] = '\0';
       }
       fclose(fp);
@@ -758,15 +820,15 @@ int main(void) {
           session_cleanup(&session);
           memset(&session, 0, sizeof(session));
           if (!session_init(&session)) {
-             fprintf(stderr, C_RED "Init failed after setup." C_RESET "\n");
-             return 1;
+            fprintf(stderr, C_RED "Init failed after setup." C_RESET "\n");
+            return 1;
           }
         } else {
-           fprintf(stderr, C_RED "Invalid key." C_RESET "\n");
-           return 1;
+          fprintf(stderr, C_RED "Invalid key." C_RESET "\n");
+          return 1;
         }
       } else {
-         return 1;
+        return 1;
       }
     } else {
       fprintf(stderr, C_RED "Init failed (Network/System)." C_RESET "\n");
@@ -845,7 +907,8 @@ int main(void) {
               printf(C_YELLOW "Modified command: %s" C_RESET "\n", edit_buf);
               execute_command(edit_buf);
             } else {
-              printf(C_YELLOW "Operation cancelled (empty command)" C_RESET "\n");
+              printf(C_YELLOW "Operation cancelled (empty command)" C_RESET
+                              "\n");
             }
           }
         }

@@ -24,6 +24,10 @@ You will need an **Anthropic API Key** to use this tool.
 ### Windows Requirements
 - `MinGW` / `gcc` (if building from source)
 
+## Releases
+
+Automated builds for Linux and Windows are available on the [GitHub Releases](https://github.com/notSido/comgen/releases) page.
+
 ## Installation
 
 ### Linux
